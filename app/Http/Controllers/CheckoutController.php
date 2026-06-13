@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Inertia\Inertia;
+use Log;
 use Stripe\Checkout\Session;
 use Stripe\Exception\SignatureVerificationException;
 use Stripe\Stripe;
@@ -30,7 +31,7 @@ class CheckoutController extends Controller
             'shipping_zone' => [
                 'required',
                 'string',
-                Rule::in(array_map(fn ($z) => $z->code, $this->shippingZones->all())),
+                Rule::in(array_map(fn($z) => $z->code, $this->shippingZones->all())),
             ],
         ]);
 
@@ -130,12 +131,30 @@ class CheckoutController extends Controller
         try {
             $event = Webhook::constructEvent($payload, $sigHeader, $secret);
         } catch (SignatureVerificationException $e) {
+            Log::error('Stripe webhook signature verification failed', [
+                'error' => $e->getMessage(),
+                'timestamp' => now()->toIso8601String(),
+            ]);
             return response('Invalid signature', 400);
         }
 
+        Log::info('Stripe webhook received', [
+            'event_type' => $event['type'],
+            'timestamp' => now()->toIso8601String(),
+        ]);
+
         if ($event->type === 'checkout.session.completed') {
             $session = $event->data->object;
-            $artworkId = (int) data_get($session, 'metadata.artwork_id');
+            $artworkId = (int)data_get($session, 'metadata.artwork_id');
+
+            Log::info('Stripe checkout session completed', [
+                'session_id' => $session->id,
+                'artwork_id' => $artworkId,
+                'amount_total' => $session->amount_total,
+                'currency' => $session->currency,
+                'payment_status' => $session->payment_status,
+                'customer_email' => $session->customer_details->email ?? null,
+            ]);
 
             // Stripe (API actual) entrega la dirección de envío en
             // collected_information.shipping_details; mantenemos el
@@ -153,7 +172,7 @@ class CheckoutController extends Controller
                         'customer_name' => data_get($session, 'customer_details.name'),
                         'customer_phone' => data_get($session, 'customer_details.phone'),
                         'amount_total' => $session->amount_total,
-                        'currency' => strtoupper((string) $session->currency),
+                        'currency' => strtoupper((string)$session->currency),
                         'payment_status' => $session->payment_status,
                         'shipping_zone' => data_get($session, 'metadata.shipping_zone'),
                         'shipping_amount' => data_get($session, 'shipping_cost.amount_total'),
@@ -168,6 +187,14 @@ class CheckoutController extends Controller
                 Artwork::where('id', $artworkId)
                     ->whereNull('vendido_at')
                     ->update(['vendido_at' => now()]);
+
+                // Log de éxito
+                $order = Order::where('stripe_session_id', $session->id)->first();
+                Log::info('Order created and artwork marked as sold', [
+                    'order_id' => $order?->id,
+                    'artwork_id' => $artworkId,
+                    'stripe_session_id' => $session->id,
+                ]);
             });
         }
 
